@@ -1,4 +1,5 @@
-from importlib.metadata import version as get_version
-
-# The package version is obtained from the pyproject.toml file
-__version__ = get_version(__package__)
+try:
+    from importlib.metadata import version as get_version
+    __version__ = get_version(__package__)
+except Exception:
+    __version__ = "0.6.0"
