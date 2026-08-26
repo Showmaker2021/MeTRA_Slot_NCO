@@ -45,10 +45,25 @@ from rl4co.models.nn.metric_loss import (
     ProjectionHead,
     SlotEntropyLoss,
 )
+from rl4co.models.rl.reinforce.baselines import SharedBaseline
 from rl4co.models.zoo.pomo_slot.policy import SlotInjectingEncoder
 from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
+
+
+class SingleSharedBaseline(SharedBaseline):
+    """Shared baseline safe for single-start decode.
+
+    Stock :class:`SharedBaseline` reduces over ``dim=1``, which assumes POMO's
+    multi-start reward layout ``[B, n_start]``. Single-start AM produces a
+    1-D reward ``[B]``, so ``dim=1`` is out of range. Averaging over the last
+    dim (``on_dim=-1``) is correct for BOTH layouts: it means over ``n_start``
+    for POMO and over the batch for single-start AM.
+    """
+
+    def eval(self, td, reward, env=None, on_dim=-1):  # e.g. [batch] or [batch, n_start]
+        return reward.mean(dim=on_dim, keepdims=True), 0
 
 
 class AMSlot(AttentionModel):
@@ -125,7 +140,13 @@ class AMSlot(AttentionModel):
             use_graph_context=am_kwargs.pop("use_graph_context", False),
         )
 
-        # ── Init AM (REINFORCE single-start, rollout baseline) ────────────
+        # ── Init AM (REINFORCE single-start) ─────────────────────────────
+        # The stock "shared" baseline reduces over dim=1 (POMO multi-start
+        # layout) and breaks on single-start rewards [B]. Route it through
+        # the single-start-safe subclass. Other strings (e.g. "rollout") are
+        # handled by rl4co as usual.
+        if isinstance(baseline, str) and baseline == "shared":
+            baseline = SingleSharedBaseline()
         super().__init__(env, policy=policy, baseline=baseline, **am_kwargs)
         self.save_hyperparameters(logger=False, ignore=["env", "policy"])
 

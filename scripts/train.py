@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -196,6 +197,16 @@ def train(
 
     pl.seed_everything(seed)
     t_cfg = TRAIN_DEFAULTS[num_loc].copy()
+
+    # Resolve devices. Default is SINGLE GPU (devices=1): the custom dataloader
+    # below has no DistributedSampler, so multi-GPU DDP here would silently
+    # duplicate data across ranks instead of sharding it — and on Windows this
+    # torch build has no NCCL. Only if the user explicitly passes devices>1 do
+    # we attempt DDP, and then we force the gloo backend on Windows. 0/None
+    # simply means "single device" (CPU if no GPU).
+    if not devices or devices <= 0:
+        devices = 1
+
     if epochs is not None:
         t_cfg["epochs"] = epochs
     if batch_size is not None:
@@ -238,13 +249,22 @@ def train(
         # Optimizer
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
-    # AM defaults to "rollout" baseline but exposes --baseline; POMO is "shared".
-    if backbone == "am" and baseline is not None:
-        model_kwargs["baseline"] = baseline
+    # AM defaults to "rollout" baseline, but rollout requires the dataloader to
+    # attach baseline values via wrap_dataset — which this custom script does NOT
+    # do. So default the AM backbone to the "shared" baseline (batch-intrinsic,
+    # works with a plain DataLoader, exactly like POMO). Override with --baseline
+    # if a different baseline is wired up.
+    if backbone == "am":
+        model_kwargs["baseline"] = baseline if baseline is not None else "shared"
     model = model_cls(**model_kwargs)
 
     # ── Callbacks ───────────────────────────────────────────────────────
-    run_name = f"{backbone}_slot_{variant}_N{num_loc}_{dist}_seed{seed}"
+    # run_name must uniquely identify the run so concurrent/serial configs
+    # (K sweep, D-vs-B ablation) never share a log dir. Include backbone,
+    # variant, K (num_slots), N, dist, seed. baseline only for am (pomo is
+    # hard-wired to "shared").
+    base_suffix = f"_bl{baseline}" if backbone == "am" and baseline else ""
+    run_name = f"{backbone}_slot_{variant}_K{num_slots}_N{num_loc}_{dist}_seed{seed}{base_suffix}"
     log_path = Path(log_dir) / run_name
 
     checkpoint_cb = ModelCheckpoint(
@@ -262,17 +282,24 @@ def train(
     logger = CSVLogger(save_dir=str(log_path), name="metrics")
 
     # ── Trainer ─────────────────────────────────────────────────────────
-    trainer = pl.Trainer(
+    trainer_kwargs = dict(
         max_epochs=t_cfg["epochs"],
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=devices,
-        strategy="ddp" if devices > 1 else "auto",
         callbacks=[checkpoint_cb, early_stop_cb],
         logger=logger,
         gradient_clip_val=1.0,
         enable_progress_bar=True,
         log_every_n_steps=10,
     )
+    if devices > 1:
+        # Multi-GPU DDP. Windows torch builds ship without NCCL; use gloo.
+        trainer_kwargs["strategy"] = "ddp"
+        if os.name == "nt":
+            trainer_kwargs["process_group_backend"] = "gloo"
+    else:
+        trainer_kwargs["strategy"] = "auto"
+    trainer = pl.Trainer(**trainer_kwargs)
 
     print(f"\n{'='*60}")
     print(f"Training POMOSlot — Variant {variant} | N={num_loc} | {dist}")
@@ -287,7 +314,9 @@ def train(
 
     best_reward = checkpoint_cb.best_model_score.item() if checkpoint_cb.best_model_score else None
     result = {
+        "backbone": backbone,
         "variant": variant,
+        "num_slots": num_slots,
         "num_loc": num_loc,
         "dist": dist,
         "seed": seed,
@@ -321,7 +350,8 @@ def main():
     parser.add_argument("--data_dir",      type=str,   default="./data/slot_datasets_v2")
     parser.add_argument("--log_dir",       type=str,   default="./logs")
     parser.add_argument("--seed",          type=int,   default=42)
-    parser.add_argument("--devices",       type=int,   default=1)
+    parser.add_argument("--devices",       type=int,   default=0,
+                        help="Number of GPUs to use (0 = all available; default). Use 1 for a single GPU.")
     parser.add_argument("--embed_dim",     type=int,   default=128)
     parser.add_argument("--num_slots",     type=int,   default=8)
     parser.add_argument("--proj_dim",      type=int,   default=64)
