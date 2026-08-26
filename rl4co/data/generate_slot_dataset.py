@@ -20,7 +20,7 @@ Output format (per split): a .pt file containing a dict:
 
 NOTE: demand convention
     demand is normalized by vehicle_capacity (Kool 2019 convention), so the
-    effective vehicle capacity seen by the model is always 1.0. This matches
+    effective vehicle capacity seeno by the model is always 1.0. This matches
     CVRPGenerator's convention in rl4co where capacity=1.0 means demands
     are pre-normalized. Cross-checked against CVRPGenerator:
         capacity = max_demand * N / 4  (Kool 2019)

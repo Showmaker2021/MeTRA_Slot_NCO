@@ -1,37 +1,28 @@
 """
-M5 — POMOSlot: POMO + Slot Attention + Metric-Aware Loss
+AMSlot — Attention Model + Slot Attention + Metric-Aware Loss
 
-A drop-in extension of rl4co's POMO model that:
-  1. Wraps the POMO encoder with SlotInjectingEncoder so that slot context
-     is fed into the decoder on every forward pass (not just in a side branch).
-  2. Reads slot embeddings from the encoder side-channel after each policy
-     forward to compute auxiliary losses (Variants A, C, D).
-  3. Adds a slot entropy regulariser to prevent slot collapse.
+Lightweight single-start counterpart to :class:`POMOSlot`. Uses the exact same
+slot module (SlotInjectingEncoder) and metric-loss machinery, but bases the
+training loop on the Attention Model (AM) instead of POMO:
 
-Ablation Variants (controlled via `metric_variant` arg):
+    AM  : single-start decode, rollout baseline, 3 encoder layers
+    POMO: multi-start decode, shared baseline,    6 encoder layers
+
+Because :class:`rl4co.models.rl.REINFORCE`'s `shared_step` is already
+single-start and backbone-agnostic, this class only needs to (1) build the
+slot-injecting policy exactly like POMOSlot and (2) call the base AM
+`shared_step` (REINFORCE's) before adding the auxiliary losses.
+
+Ablation Variants (controlled via `metric_variant`):
   "none" / "B" : No metric loss — slot learns purely from task (REINFORCE) loss
   "A"           : Reconstruction loss (MSE on slot centroids vs node coords)
   "C"           : Metric loss with Euclidean centroid distance as target
   "D"           : Metric loss with insertion-cost distance (proposed method)
   # "E"         : Future-regret target — reserved, not implemented yet
 
-Augmentation note:
-  POMO disables augmentation during training (n_aug=0). Aux losses are only
-  computed during training. Therefore slots and d_ins always share batch size B.
-  If aux losses are ever extended to val/test, d_ins must be repeated by
-  num_augment before passing to metric_loss_fn.
-
-Usage example (Variant D):
-    from rl4co.models.zoo.pomo_slot import POMOSlot
-
-    model = POMOSlot(
-        env,
-        embed_dim=128,
-        num_slots=8,
-        metric_variant="D",
-        alpha_metric=0.1,
-        beta_entropy=0.01,
-    )
+Usage:
+    from rl4co.models.zoo.pomo_slot import AMSlot
+    model = AMSlot(env, embed_dim=128, num_slots=8, metric_variant="D")
 """
 
 from __future__ import annotations
@@ -44,7 +35,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from rl4co.envs.common.base import RL4COEnvBase
-from rl4co.models.zoo.pomo import POMO
+from rl4co.models.zoo.am import AttentionModel
 from rl4co.models.zoo.am import AttentionModelPolicy
 from rl4co.models.zoo.am.encoder import AttentionModelEncoder
 from rl4co.models.nn.slot_attention import SlotAttention
@@ -60,19 +51,17 @@ from rl4co.utils.pylogger import get_pylogger
 log = get_pylogger(__name__)
 
 
-class POMOSlot(POMO):
+class AMSlot(AttentionModel):
     """
-    POMO extended with Metric-Aware Slot Abstraction.
+    Attention Model extended with Metric-Aware Slot Abstraction.
 
-    Inherits the full POMO training loop (REINFORCE, multi-start).
-    Replaces the POMO encoder with a SlotInjectingEncoder so that slot
-    context is visible to the decoder on every step. Overrides shared_step
-    only to extract d_ins from the batch and add auxiliary losses.
+    Lightweight, single-start (rollout-baseline) alternative to POMOSlot for
+    fast iteration. Same slot module and metric loss; only the REINFORCE
+    training loop differs (AM rollout baseline + single-start decode).
 
     Args:
         env: RL4CO environment (e.g. CVRP).
-        embed_dim (int): Encoder/decoder embedding dimension. Must match
-            the AttentionModelPolicy embed_dim. Default: 128.
+        embed_dim (int): Encoder/decoder embedding dimension. Default: 128.
         num_slots (int): K — number of slot/region embeddings.
         metric_variant (str): Ablation variant — one of "none"/"B", "A", "C", "D".
         alpha_metric (float): Weight for metric preservation/reconstruction loss.
@@ -81,7 +70,9 @@ class POMOSlot(POMO):
         proj_dim (int): Projection dimension for phi(z_k) in metric loss.
         lambda_init (float): Initial Lagrange multiplier for MetricPreservationLoss.
         lr_dual (float): Learning rate for dual ascent on lambda (log_lambda param group).
-        **pomo_kwargs: All remaining kwargs forwarded to POMO base class.
+        k_neighbors (int): kNN sparsification for on-the-fly d_ins computation (Variant D).
+        baseline (str): REINFORCE baseline — "rollout" (default, true AM) or "shared".
+        **am_kwargs: Remaining kwargs forwarded to AttentionModel base class.
     """
 
     # "E" excluded: future-regret target not yet implemented
@@ -100,7 +91,8 @@ class POMOSlot(POMO):
         lambda_init: float = 1.0,
         lr_dual: float = 1e-3,
         k_neighbors: int = 15,
-        **pomo_kwargs,
+        baseline: str = "rollout",
+        **am_kwargs,
     ) -> None:
         assert metric_variant in self.METRIC_VARIANTS, (
             f"metric_variant must be one of {self.METRIC_VARIANTS}, got '{metric_variant}'"
@@ -114,13 +106,14 @@ class POMOSlot(POMO):
         )
 
         # ── Build base encoder, wrap it with slot injection ───────────────
+        # AM default is 3 encoder layers (lighter than POMO's 6). Overridable.
         base_encoder = AttentionModelEncoder(
             embed_dim=embed_dim,
-            num_heads=pomo_kwargs.pop("num_heads", 8),
-            num_layers=pomo_kwargs.pop("num_encoder_layers", 6),
+            num_heads=am_kwargs.pop("num_heads", 8),
+            num_layers=am_kwargs.pop("num_encoder_layers", 3),
             env_name=env.name,
-            normalization=pomo_kwargs.pop("normalization", "instance"),
-            feedforward_hidden=pomo_kwargs.pop("feedforward_hidden", 512),
+            normalization=am_kwargs.pop("normalization", "instance"),
+            feedforward_hidden=am_kwargs.pop("feedforward_hidden", 512),
         )
         slot_encoder = SlotInjectingEncoder(base_encoder, slot_attn)
 
@@ -129,11 +122,11 @@ class POMOSlot(POMO):
             encoder=slot_encoder,
             embed_dim=embed_dim,
             env_name=env.name,
-            use_graph_context=pomo_kwargs.pop("use_graph_context", False),
+            use_graph_context=am_kwargs.pop("use_graph_context", False),
         )
 
-        # ── Init POMO (which sets up REINFORCE, shared baseline, etc.) ────
-        super().__init__(env, policy=policy, **pomo_kwargs)
+        # ── Init AM (REINFORCE single-start, rollout baseline) ────────────
+        super().__init__(env, policy=policy, baseline=baseline, **am_kwargs)
         self.save_hyperparameters(logger=False, ignore=["env", "policy"])
 
         self.embed_dim = embed_dim
@@ -164,13 +157,14 @@ class POMOSlot(POMO):
             )
 
         log.info(
-            f"POMOSlot: embed_dim={embed_dim}, K={num_slots}, "
-            f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}"
+            f"AMSlot: embed_dim={embed_dim}, K={num_slots}, "
+            f"variant={metric_variant}, alpha={alpha_metric}, beta={beta_entropy}, "
+            f"baseline={baseline}"
         )
 
     # ────────────────────────────────────────────────────────────────────────
     # configure_optimizers: add separate param group for log_lambda (dual ascent)
-    # Delegates back to base class to preserve the POMO LR scheduler.
+    # Delegates back to base class to preserve the AM LR scheduler.
     # ────────────────────────────────────────────────────────────────────────
 
     def configure_optimizers(self):
@@ -188,24 +182,12 @@ class POMOSlot(POMO):
             {"params": main_params},                      # uses base lr + scheduler
             {"params": dual_params, "lr": lr_dual},       # dual ascent, no scheduler
         ]
-        # super().configure_optimizers(parameters) builds optimizer+scheduler using
-        # RL4COLitModule machinery, so we preserve scheduler type and kwargs exactly.
         return super().configure_optimizers(parameters=param_groups)
 
     # ────────────────────────────────────────────────────────────────────────
     # on_after_optimizer_step: bound log_lambda (dual ascent) growth
+    # (Same safety net as POMOSlot — see model.py for rationale.)
     # ────────────────────────────────────────────────────────────────────────
-    # The dual-ascent update on log_lambda is self-reinforcing: its gradient is
-    # proportional to lambda itself (d/dlog_lambda of -lambda * penalty =
-    # -penalty * lambda). If a batch produces a sudden penalty spike this can
-    # push lambda up hyper-exponentially with no natural bound, which then
-    # dominates `loss = spread + lambda.detach() * penalty` and corrupts the
-    # shared encoder -> policy gradient (entropy spike / reward crash).
-    #
-    # Clamp log_lambda after every optimiser step so lambda = exp(log_lambda)
-    # never exceeds LAMBDA_MAX. This is a cheap safety net that bounds the
-    # runaway regardless of its root cause. LAMBDA_MAX is a hyperparameter that
-    # can be tuned (via self.lambda_max, default 50.0).
 
     def on_after_optimizer_step(self, optimizer):
         if self.metric_loss_fn is None:
@@ -215,14 +197,15 @@ class POMOSlot(POMO):
             self.metric_loss_fn.log_lambda.data.clamp_(max=math.log(lambda_max))
 
     # ────────────────────────────────────────────────────────────────────────
-    # shared_step: extract d_ins, run POMO, read slot side-channel, add aux loss
+    # shared_step: extract d_ins, run AM (single-start), read slot side-channel,
+    # add aux loss. Mirrors POMOSlot.shared_step except it calls the base AM
+    # (REINFORCE) step — already single-start, so no multistart reshape needed.
     # ────────────────────────────────────────────────────────────────────────
 
     def shared_step(
         self, batch: Any, batch_idx: int, phase: str, dataloader_idx: int = None
     ):
-        # ── Extract sparse d_ins keys from batch BEFORE passing to POMO ──
-        # d_ins_idx / d_ins_val are slot-only keys not understood by CVRPEnv.
+        # ── Extract sparse d_ins keys from batch BEFORE passing to base ──
         d_ins_idx = None
         d_ins_val = None
 
@@ -246,28 +229,14 @@ class POMOSlot(POMO):
             d_ins_idx = d_ins_idx.to(device)  # keep as int16 for transfer, cast in loss fn
         if d_ins_val is not None:
             d_ins_val = d_ins_val.to(device)
-        # ── Read locs BEFORE super().shared_step() mutates the batch ──────
-        # After super() calls env.reset(batch), batch gains 'visited' (shape B,N+1).
-        # We cannot call env.reset(batch) again without a shape mismatch.
-        # Instead, extract customer locs (excluding depot) directly from batch here.
-        # CVRPEnv stores customers at locs[:, 0:N, :] and depot separately.
-        # Our dataset stores them as locs (B,N,2) without depot prepended.
-        # The encoder sees locs with depot prepended by the env's init_embedding.
+        # ── Read locs BEFORE base shared_step mutates the batch ──────────
         locs_customers: torch.Tensor | None = None
         if self.metric_variant not in ("none", "B"):
             raw_locs = batch.get("locs") if hasattr(batch, "get") else batch["locs"]
             locs_customers = raw_locs.to(device)  # (B, N, 2) — customers only, no depot
 
         # ── Fallback: compute d_ins on-the-fly if Variant D needs it, but the
-        # dataset didn't cache it (e.g. the standard `run.py` TSP/CVRP pipeline).
-        # This mirrors generate_slot_dataset.build_sparse_d_ins so batched training
-        # works without precomputed d_ins matrices.
-        #
-        # NOTE on node indexing: A_ik is built over hidden[:, 1:, :], i.e. node
-        # index 0 is treated as a pseudo-depot (see SlotInjectingEncoder). So the
-        # on-the-fly d_ins must cover the SAME customer nodes as A_ik (N-1), with
-        # node 0 used as the depot origin — otherwise the aggregation in
-        # _aggregate_d_ins_sparse sees an N mismatch with A_ik.
+        # dataset didn't cache it (mirrors POMOSlot — see model.py for indexing notes)
         if (
             self.metric_variant == "D"
             and d_ins_idx is None
@@ -281,7 +250,7 @@ class POMOSlot(POMO):
                 customers, k_neighbors=self.k_neighbors, depot_loc=depot
             )  # (B, N_cust, k) int16, (B, N_cust, k) float32
 
-        # ── Run standard POMO step ────────────────────────────────────────
+        # ── Run standard AM (REINFORCE) step — single-start ──────────────
         # SlotInjectingEncoder runs inside policy.forward() here.
         # After this call, slots and A_ik are available via side-channel.
         out = super().shared_step(batch, batch_idx, phase, dataloader_idx)
@@ -291,7 +260,6 @@ class POMOSlot(POMO):
             return out
 
         # ── Read slot side-channel ────────────────────────────────────────
-        # policy.encoder is our SlotInjectingEncoder
         slots = self.policy.encoder.last_slots  # (B, K, d)
         A_ik  = self.policy.encoder.last_A_ik   # (B, N, K)
 
@@ -310,7 +278,7 @@ class POMOSlot(POMO):
 
         # Variant A: reconstruction loss (slot centroids vs node coords)
         if self.metric_variant == "A":
-            locs = locs_customers  # (B, N, 2) customers only, read before super() above
+            locs = locs_customers  # (B, N, 2) customers only
             A_norm = A_ik / (A_ik.sum(dim=1, keepdim=True) + 1e-8)
             centroids = torch.einsum("bnk,bnc->bkc", A_norm, locs)
             recon = torch.einsum("bnk,bkc->bnc", A_ik, centroids)
@@ -320,7 +288,7 @@ class POMOSlot(POMO):
 
         # Variants C / D: metric preservation loss
         elif self.metric_loss_fn is not None:
-            locs = locs_customers  # (B, N, 2) customers only, read before super() above
+            locs = locs_customers  # (B, N, 2) customers only
             metric_loss, metric_info = self.metric_loss_fn(
                 slots=slots,
                 A_ik=A_ik,

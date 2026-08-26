@@ -12,6 +12,7 @@ slot_iters: 3
 proj_dim: 64
 lambda_init: 1.0
 lr_dual: 1.0e-3
+k_neighbors: 15   # kNN sparsification for on-the-fly d_ins computation (Variant D)
 
 num_encoder_layers: 6
 normalization: "instance"

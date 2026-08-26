@@ -40,11 +40,18 @@ from lightning.pytorch.loggers import CSVLogger
 # Lazy import to avoid torchrl DLL on some setups
 try:
     from rl4co.envs import CVRPEnv
-    from rl4co.models.zoo.pomo_slot import POMOSlot
+    from rl4co.models.zoo.pomo_slot import POMOSlot, AMSlot
     FULL_RL4CO = True
 except Exception as e:
     print(f"[WARN] Full rl4co import failed: {e}")
     FULL_RL4CO = False
+
+# Model registry: choose POMO (multi-start, shared baseline) or
+# AM (single-start, rollout baseline) backbone.
+MODEL_CLASSES = {
+    "pomo": POMOSlot,
+    "am": AMSlot,
+}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -179,6 +186,8 @@ def train(
     epochs: int | None = None,
     batch_size: int | None = None,
     max_instances: int | None = None,
+    backbone: str = "pomo",
+    baseline: str | None = None,
 ):
     assert FULL_RL4CO, (
         "Full rl4co import failed. Ensure torchrl DLL is installed correctly "
@@ -215,7 +224,8 @@ def train(
     env = CVRPEnv(generator_kwargs=dict(num_loc=num_loc))
 
     # ── Model ───────────────────────────────────────────────────────────
-    model = POMOSlot(
+    model_cls = MODEL_CLASSES[backbone]   # "pomo" -> POMOSlot, "am" -> AMSlot
+    model_kwargs = dict(
         env=env,
         embed_dim=embed_dim,
         num_slots=num_slots,
@@ -228,9 +238,13 @@ def train(
         # Optimizer
         optimizer_kwargs={"lr": t_cfg["lr"]},
     )
+    # AM defaults to "rollout" baseline but exposes --baseline; POMO is "shared".
+    if backbone == "am" and baseline is not None:
+        model_kwargs["baseline"] = baseline
+    model = model_cls(**model_kwargs)
 
     # ── Callbacks ───────────────────────────────────────────────────────
-    run_name = f"pomo_slot_{variant}_N{num_loc}_{dist}_seed{seed}"
+    run_name = f"{backbone}_slot_{variant}_N{num_loc}_{dist}_seed{seed}"
     log_path = Path(log_dir) / run_name
 
     checkpoint_cb = ModelCheckpoint(
@@ -318,6 +332,10 @@ def main():
     parser.add_argument("--batch_size",    type=int,   default=None)
     parser.add_argument("--max_instances", type=int,   default=None,
                         help="Cap dataset size for quick smoke tests")
+    parser.add_argument("--backbone",      type=str,   default="pomo", choices=["pomo", "am"],
+                        help="Backbone: 'pomo' (multi-start, shared baseline) or 'am' (single-start, rollout baseline)")
+    parser.add_argument("--baseline",      type=str,   default=None,
+                        help="REINFORCE baseline for the AM backbone (e.g. rollout, shared). Ignored for pomo.")
     args = parser.parse_args()
 
     train(
@@ -337,6 +355,8 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         max_instances=args.max_instances,
+        backbone=args.backbone,
+        baseline=args.baseline,
     )
 
 
